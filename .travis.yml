@@ -9,8 +9,4 @@ os:
 - linux
 - osx
 - windows
-branches:
-  only:
-    - master
-    - develop
 script: cargo test
