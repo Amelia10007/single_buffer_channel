@@ -19,7 +19,24 @@
 //!
 //! // Update the latest value.
 //! updater.update(1).unwrap();
+//! // recv() blocks current thread unless the latest value is updated.
 //! assert_eq!(Ok(1), receiver.recv());
+//!
+//! updater.update(10).unwrap();
+//!
+//! // try_recv() does not block current thread.
+//! assert_eq!(Ok(10), receiver.try_recv());
+//! // try_recv() returns an error because the sender sends nothing yet from the time recv(), try_recv() or recv_timeout() was called.
+//! assert!(receiver.try_recv().is_err());
+//!
+//! // Updater can be cloned
+//! let updater_another = updater.clone();
+//!
+//! updater.update(2).unwrap();
+//! updater_another.update(3).unwrap();
+//!
+//! // Only the latest value can be received.
+//! assert_eq!(Ok(3), receiver.recv());
 //! ```
 
 use std::error::Error;
