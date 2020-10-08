@@ -353,6 +353,20 @@ mod tests {
     }
 
     #[test]
+    fn test_try_recv_multiple_updaters() {
+        let (updater, receiver) = channel();
+        let updater2 = updater.clone();
+
+        // Receiver should receive only the latest value
+        updater.update(1).unwrap();
+        updater2.update(2).unwrap();
+        assert_eq!(Ok(2), receiver.try_recv());
+
+        // Nothing updated from the last reception
+        assert_eq!(Err(TryRecvError::Empty), receiver.try_recv());
+    }
+
+    #[test]
     fn test_try_recv_no_updater() {
         let (updater, receiver) = channel::<i32>();
         drop(updater);
