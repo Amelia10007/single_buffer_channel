@@ -1,0 +1,16 @@
+language: rust
+rust: stable
+env: RUST_BACKTRACE=full
+matrix:
+  include:
+  - os: linux
+    rust: nightly
+os:
+- linux
+- osx
+- windows
+branches:
+  only:
+    - master
+    - develop
+script: cargo test
