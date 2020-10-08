@@ -396,6 +396,7 @@ mod tests {
         let join_handle = spawn(move || {
             sleep(Duration::from_secs(1));
             updater.update(1).unwrap();
+            sleep(Duration::from_secs(1));
         });
 
         assert_eq!(Ok(1), receiver.recv_timeout(Duration::from_secs(2)));
