@@ -1,178 +1,195 @@
-//! Multi-producer, single-consumer single value communication primitives.
+//! Multi-producer, single-consumer ***SINGLE*** data communication primitives.
 //!
-//! This crate provides a latest-message style channel,
-//! where update sources can update the latest value that the receiver owns it.
+//! This crate provides a latest-message style [`channel`](fn.channel.html),
+//! where [`Updater`](struct.Updater.html)(s) can update the latest data that the [`Receiver`](struct.Receiver.html) owns it.
 //!
-//! Unlike the `mpsc::channel` each value send will overwrite the 'latest' value.
-//!
-//! This is useful, for example, when thread ***A*** is interested in the latest result of another
-//! continually working thread ***B***. ***B*** could update the channel with it's latest result
-//! each iteration, each new update becoming the new 'latest' value. Then ***A*** can own the latest value.
-//!
-//! The internal sync primitives are private and essentially only lock over fast data moves.
+//! Unlike the `std::sync::mpsc::channel`, by using `channel` of this crate, each data send will overwrite the original data.
+//! Once the `receiver` receives the data of its channel, `receiver` can retrieve nothing unless the updater(s) updates the data.
+//! These property are useful, for example, when a thread is interested in the ***latest*** result of another continually working thread.
 //!
 //! # Examples
+//! ## Basic usage
 //! ```
 //! use single_buffer_channel::channel;
 //!
 //! let (updater, receiver) = channel();
 //!
-//! // Update the latest value.
-//! updater.update(1).unwrap();
-//! // recv() blocks current thread unless the latest value is updated.
+//! std::thread::spawn(move || {
+//!     updater.update(1).unwrap();
+//! })
+//! .join().unwrap();
+//!
 //! assert_eq!(Ok(1), receiver.recv());
+//! ```
+//! ## Multiple update
+//! ```
+//! use single_buffer_channel::channel;
+//!
+//! let (updater, receiver) = channel();
+//! let updater2 = updater.clone(); // updater can be cloned.
+//!
+//! // Only the latest data will be received
+//! updater.update(1).unwrap();
+//! updater.update(2).unwrap();
+//! assert_eq!(Ok(2), receiver.recv());
 //!
 //! updater.update(10).unwrap();
+//! updater2.update(20).unwrap();
+//! assert_eq!(Ok(20), receiver.recv());
 //!
-//! // try_recv() does not block current thread.
-//! assert_eq!(Ok(10), receiver.try_recv());
-//! // try_recv() returns an error because the sender sends nothing yet from the time recv(), try_recv() or recv_timeout() was called.
-//! assert!(receiver.try_recv().is_err());
+//! // Channel is valid as long as at least 1 updater exists.
+//! drop(updater);
+//! updater2.update(200).unwrap();
+//! assert_eq!(Ok(200), receiver.recv());
+//! ```
+//! ## Receive after updater dropped
+//! ```
+//! use single_buffer_channel::channel;
 //!
-//! // Updater can be cloned
-//! let updater_another = updater.clone();
+//! let (updater, receiver) = channel::<i32>();
 //!
-//! updater.update(2).unwrap();
-//! updater_another.update(3).unwrap();
+//! drop(updater);
+//! // The updater dropped and no data exists on the buffer. So recv() fails.
+//! assert!(receiver.recv().is_err());
+//! ```
+//! ## Receive after update and updater dropped
+//! ```
+//! use single_buffer_channel::channel;
 //!
-//! // Only the latest value can be received.
-//! assert_eq!(Ok(3), receiver.recv());
+//! let (updater, receiver) = channel();
+//!
+//! updater.update(1).unwrap();
+//! drop(updater);
+//!
+//! // The updater dropped. but the updated data remains, so recv() succeeds.
+//! assert_eq!(Ok(1), receiver.recv());
+//!
+//! // The updater dropped and no data exists on the buffer. So recv() fails.
+//! assert!(receiver.recv().is_err());
 //! ```
 
 use std::error::Error;
 use std::fmt::{self, Debug, Display, Formatter};
 use std::sync::{Arc, Mutex, Weak};
-use std::time::{Duration, Instant};
 
-/// The receiving-half of the single value channel.
-/// Values sent to the channel can be retrieved using `recv`, `try_recv` and `recv_timeout`.
+/// The receiving-half of the single data channel.
+///
+/// Latest data of the channel can be retrieved using `recv` and `try_recv`.
 #[derive(Debug)]
 pub struct Receiver<T> {
-    latest: Arc<Mutex<Option<T>>>,
+    /// Stores the latest data as `Some(data)`, or `None` if updater(s) has not call its `update` yet.
+    buffer: Arc<Mutex<Option<T>>>,
 }
 
 impl<T> Receiver<T> {
-    /// Waits the latest value of this channel.
+    /// Waits the latest data of this channel. This method blocks the current thread.
+    ///
+    /// After successful reception, nothing can be retrieved unless the updater(s) updates the data.
     /// # Returns
-    /// `Ok()` if the latest value can be retrieved.
-    /// `Err()` if no updater of this channel exists.
+    /// `Ok()` if the latest data can be retrieved.
+    /// `Err()` if the data has not been updated since the last call of `recv` or `try_recv` and there is no updater of this channel.
     ///
     /// # Examples
+    /// ## Basic usage
     /// ```
     /// use single_buffer_channel::channel;
     ///
     /// let (updater, receiver) = channel();
     ///
-    /// // Receive the latest sent value.
     /// updater.update(1).unwrap();
     /// assert_eq!(Ok(1), receiver.recv());
+    /// ```
+    /// ## Receive after updater dropped
+    /// ```
+    /// use single_buffer_channel::channel;
     ///
-    /// // Nothing never received because the updater does not exist.
+    /// let (updater, receiver) = channel::<i32>();
+    ///
     /// drop(updater);
+    /// // The updater dropped and no data exists on the buffer. So recv() fails.
+    /// assert!(receiver.recv().is_err());
+    /// ```
+    /// ## Receive after update and updater dropped
+    /// ```
+    /// use single_buffer_channel::channel;
+    ///
+    /// let (updater, receiver) = channel();
+    ///
+    /// updater.update(1).unwrap();
+    /// drop(updater);
+    ///
+    /// // The updater dropped. but the updated data remains, so recv() succeeds.
+    /// assert_eq!(Ok(1), receiver.recv());
+    ///
+    /// // The updater dropped and no data exists on the buffer. So recv() fails.
     /// assert!(receiver.recv().is_err());
     /// ```
     pub fn recv(&self) -> Result<T, RecvError> {
         loop {
             match self.try_recv() {
-                Ok(value) => break Ok(value),
+                Ok(data) => break Ok(data),
                 Err(TryRecvError::Disconnected) => break Err(RecvError),
                 _ => {}
             }
         }
     }
 
-    /// Attempts to receive the latest value of this channel.
+    /// Attempts to receive the latest data of this channel. This method does not block the current thread.
     ///
-    /// After successful reception, nothing can be retrieved unless updater(s) sends a next value.
+    /// After successful reception, nothing can be retrieved unless the updater(s) updates the data.
+    /// *See also the examples of [`Receiver::recv`](struct.Receiver.html#method.recv) to understand behaviors when the updater(s) has disconnected.*
     /// # Returns
-    /// `Ok()` if the latest value can be retrieved.
-    /// `Err()` if any condition satisfies:
-    /// - no updater of this channel exists.
-    /// - an updater of this channel is sending the latest value.
-    /// - nothing has been sent from the last reception.
+    /// `Ok()` if the latest data can be retrieved.
+    /// `Err()` if
+    /// - The data has not been updated since the last call of `recv` or `try_recv`.
+    /// - There is no updater of this channel.
     ///
     /// # Examples
     /// ```
     /// use single_buffer_channel::channel;
     ///
     /// let (updater, receiver) = channel();
-    /// // Nothing sent yet.
+    /// // Nothing updated yet.
     /// assert!(receiver.try_recv().is_err());
     ///
-    /// // Receive the latest sent value.
     /// updater.update(1).unwrap();
     /// assert_eq!(Ok(1), receiver.try_recv());
     ///
-    /// // Nothing sent yet from the last reception.
+    /// // Nothing updated yet from the last reception.
     /// assert!(receiver.try_recv().is_err());
     /// ```
     pub fn try_recv(&self) -> Result<T, TryRecvError> {
-        if !self.has_updater() {
-            Err(TryRecvError::Disconnected)
-        } else {
-            // lock() fails if another owner of the `Mutex` has panicked during holding the mutex.
-            // But the owners (`Updater`) never panic at the time.
-            // Therefore, this unwrap() always succeeds.
-            match self.latest.lock().unwrap().take() {
-                Some(value) => Ok(value),
-                None => Err(TryRecvError::Empty),
-            }
-        }
-    }
-
-    /// Waits the latest value of this channel is sent until the specified duration.
-    ///
-    /// After successful reception, nothing can be retrieved unless updater(s) sends a next value.
-    /// # Returns
-    /// `Ok()` if the latest value can be retrieved.
-    /// `Err()` if any condition satisfies:
-    /// - no updater of this channel exists.
-    /// - nothing has been sent for the specified duration.
-    ///
-    /// # Examples
-    /// ```
-    /// use std::time::Duration;
-    /// use single_buffer_channel::channel;
-    ///
-    /// let (updater, receiver) = channel();
-    ///
-    /// // Receive the latest sent value.
-    /// updater.update(1).unwrap();
-    /// assert_eq!(Ok(1), receiver.recv_timeout(Duration::from_secs(1)));
-    ///
-    /// // Timeout because nothing has been sent for 1 second.
-    /// assert!(receiver.recv_timeout(Duration::from_secs(1)).is_err());
-    /// ```
-    pub fn recv_timeout(&self, timeout: Duration) -> Result<T, RecvTimeoutError> {
-        let start = Instant::now();
-
-        loop {
-            if start.elapsed() > timeout {
-                break Err(RecvTimeoutError::Timeout);
-            }
-            match self.try_recv() {
-                Ok(value) => break Ok(value),
-                Err(TryRecvError::Disconnected) => break Err(RecvTimeoutError::Disconnected),
-                _ => {}
+        // lock() fails if another owner of the mutex has panicked during holding it.
+        // But the owners (updater) never panic at the time.
+        // Therefore, this unwrap() always succeeds.
+        match self.buffer.lock().unwrap().take() {
+            Some(data) => Ok(data),
+            None => {
+                let has_updater = self.has_updater();
+                if has_updater {
+                    Err(TryRecvError::Empty)
+                } else {
+                    Err(TryRecvError::Disconnected)
+                }
             }
         }
     }
 
     /// Returns `true` if there is at least 1 updater of this channel.
     fn has_updater(&self) -> bool {
-        Arc::weak_count(&self.latest) != 0
+        Arc::weak_count(&self.buffer) != 0
     }
 }
 
 /// An error returned from the `recv` function on a `Receiver`.
 ///
-/// This error occurs if the sender(s) has become disconnected.
+/// This error occurs if `Receiver` has become unable to receive data anymore due to the updater(s)' disconnection.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct RecvError;
 
 impl Display for RecvError {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "The sender(s) has become disconnected, and there will never be any more data received on it.")
+        write!(f, "This receiver has become unable to receive data anymore due to the updater(s)' disconnection.")
     }
 }
 
@@ -181,7 +198,7 @@ impl Error for RecvError {}
 /// An error returned from the `try_recv` function on a `Receiver`.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum TryRecvError {
-    /// The sender(s) has become disconnected, and there will never be any more data received on it.
+    /// This error occurs if `Receiver` has become unable to receive data anymore due to the updater(s)' disconnection.
     Disconnected,
     /// This channel is currently empty, but the updater(s) have not yet disconnected, so data may yet become available.
     Empty,
@@ -190,8 +207,8 @@ pub enum TryRecvError {
 impl Display for TryRecvError {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         let msg = match self {
-            TryRecvError::Disconnected => "The sender(s) has become disconnected, and there will never be any more data received on it.",
-            TryRecvError::Empty => "This channel is currently empty, but the updater(s) have not yet disconnected, so data may yet become available.",
+            TryRecvError::Disconnected => "This receiver has become unable to receive data anymore due to the updater(s)' disconnection.",
+            TryRecvError::Empty => "This channel is currently empty, but the updater(s) have not disconnected yet, so data may become available.",
         };
         write!(f, "{}", msg)
     }
@@ -199,70 +216,70 @@ impl Display for TryRecvError {
 
 impl Error for TryRecvError {}
 
-/// An error returned from the `recv_timeout` function on a `Receiver`.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum RecvTimeoutError {
-    /// This channel is currently empty, but the updater(s) have not yet disconnected, so data may yet become available.
-    Timeout,
-    /// The sender(s) has become disconnected, and there will never be any more data received on it.
-    Disconnected,
-}
-
-impl Display for RecvTimeoutError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        let msg = match self {
-            RecvTimeoutError::Timeout => "This channel is currently empty, but the updater(s) have not yet disconnected, so data may yet become available.",
-            RecvTimeoutError::Disconnected => "The updater(s) has become disconnected, and there will never be any more data received on it.",
-        };
-        write!(f, "{}", msg)
-    }
-}
-
-impl Error for RecvTimeoutError {}
-
-/// The updating-half of the single value channel.
-#[derive(Debug, Clone)]
+/// The updating-half of the single data channel.
+///
+/// Data of this the channel can be updated by `update`.
+/// `update` will overwrite the existing data of the channel.
+///
+/// The `Updater` can be cloned to update to the same channel multiple times.
+#[derive(Debug)]
 pub struct Updater<T> {
-    destination: Weak<Mutex<Option<T>>>,
+    /// Destination to the buffer of the recevier.
+    dest: Weak<Mutex<Option<T>>>,
 }
 
 impl<T> Updater<T> {
-    /// Updates the latest value of this channel.
+    /// Updates the data of this channel.
+    /// Previous data will be overwritten if it exists.
     /// # Returns
-    /// `Ok()` if the latest value can be updated.
-    /// `Err()` if no receiver of this channel exists.
+    /// `Ok()` if the data is updated.
+    /// `Err()` if there is no receiver of this channel.
     ///
     /// # Examples
+    /// ## Basic usage
     /// ```
     /// use single_buffer_channel::channel;
     ///
     /// let (updater, receiver) = channel();
     ///
-    /// // Update the latest value.
     /// updater.update(1).unwrap();
     /// assert_eq!(Ok(1), receiver.recv());
-    ///
-    /// // Cannot update the value because the receiver does not exist.
-    /// drop(receiver);
-    /// assert!(updater.update(10).is_err());
     /// ```
-    pub fn update(&self, value: T) -> Result<(), UpdateError<T>> {
-        match self.destination.upgrade() {
+    /// ## `update` after `Receiver` dropped
+    /// ```
+    /// use single_buffer_channel::channel;
+    ///
+    /// let (updater, receiver) = channel();
+    ///
+    /// // update() fails because there is no receiver of this channel.
+    /// drop(receiver);
+    /// assert!(updater.update(1).is_err());
+    /// ```
+    pub fn update(&self, data: T) -> Result<(), UpdateError<T>> {
+        match self.dest.upgrade() {
             Some(dest) => {
-                // lock() fails if another owner of the `Mutex` has panicked during holding the mutex.
-                // But the owners (`Receiver` and other `Updater`) never panic at the time.
+                // lock() fails if another owner of the mutex has panicked during holding it.
+                // But the owners (receiver and other updaters) never panic at the time.
                 // Therefore, this unwrap() always succeeds.
-                dest.lock().unwrap().replace(value);
+                dest.lock().unwrap().replace(data);
                 Ok(())
             }
-            None => Err(UpdateError(value)),
+            None => Err(UpdateError(data)),
+        }
+    }
+}
+
+impl<T> Clone for Updater<T> {
+    fn clone(&self) -> Self {
+        Self {
+            dest: self.dest.clone(),
         }
     }
 }
 
 /// An error returned from the `update` function on a `Updater`.
 ///
-/// This error occurs if the receiver has become disconnected, so the data could not be sent.
+/// This error occurs if the receiver has become disconnected, so the data could not be updated.
 /// The data is returned back to the callee in this case.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct UpdateError<T>(T);
@@ -271,7 +288,7 @@ impl<T> Display for UpdateError<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "The receiver has disconnected, so the data could not be sent."
+            "The receiver has disconnected, so the data could not be updated."
         )
     }
 }
@@ -280,22 +297,21 @@ impl<T: Debug> Error for UpdateError<T> {}
 
 /// Creates a new channel, returning the updater/receiver halves.
 ///
-/// The `Updater` can be cloned to send to the same channel multiple times, but only one `Receiver` is supported.
+/// The `Updater` can be cloned to update to the same channel multiple times, but only one `Receiver` is supported.
 /// # Examples
 /// ```
 /// use single_buffer_channel::channel;
 ///
 /// let (updater, receiver) = channel();
 ///
-/// // Update the latest value.
 /// updater.update(1).unwrap();
 /// assert_eq!(Ok(1), receiver.recv());
 /// ```
 pub fn channel<T>() -> (Updater<T>, Receiver<T>) {
-    let latest = Arc::from(Mutex::from(None));
-    let weak = Arc::downgrade(&latest);
-    let receiver = Receiver { latest };
-    let updater = Updater { destination: weak };
+    let buffer = Arc::from(Mutex::from(None));
+    let dest = Arc::downgrade(&buffer);
+    let receiver = Receiver { buffer };
+    let updater = Updater { dest };
 
     (updater, receiver)
 }
@@ -303,18 +319,15 @@ pub fn channel<T>() -> (Updater<T>, Receiver<T>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::thread::{sleep, spawn};
 
     #[test]
     fn test_update_recv() {
         let (updater, receiver) = channel();
-        // Update
+
         updater.update(1).unwrap();
-        //
         assert_eq!(Ok(1), receiver.recv());
-        // Update
+
         updater.update(2).unwrap();
-        //
         assert_eq!(Ok(2), receiver.recv());
     }
 
@@ -324,7 +337,8 @@ mod tests {
         // Update
         updater.update(1).unwrap();
         updater.update(2).unwrap();
-        // Receiver should receive only the latest value
+
+        // Only the latest data will be received
         assert_eq!(Ok(2), receiver.recv());
     }
 
@@ -338,33 +352,67 @@ mod tests {
         updater2.update(2).unwrap();
         assert_eq!(Ok(2), receiver.recv());
 
-        // Receiver should receive only the latest value
+        // Only the latest data will be received
         updater.update(10).unwrap();
         updater2.update(20).unwrap();
         assert_eq!(Ok(20), receiver.recv());
 
-        // channel is valid since at least 1 updater exists.
+        // Channel is valid since at least 1 updater exists.
         drop(updater);
         updater2.update(200).unwrap();
         assert_eq!(Ok(200), receiver.recv());
     }
 
     #[test]
-    fn test_recv_no_updater() {
+    fn test_update_recv_multithread() {
+        let (updater, receiver) = channel();
+
+        // Update on another thread
+        std::thread::spawn(move || {
+            updater.update(1).unwrap();
+            updater.update(2).unwrap();
+
+            // Updater dropped here, but there is data in buffer of the channel.
+            // The data can be retrieved by the receiver.
+        })
+        .join()
+        .unwrap();
+
+        // Only the latest data will be received
+        assert_eq!(Ok(2), receiver.recv());
+    }
+
+    #[test]
+    fn test_recv_from_remaining_data_disconnected_updater() {
+        let (updater, receiver) = channel();
+        updater.update(1).unwrap();
+        drop(updater);
+
+        // The updater dropped.
+        // but the updated data remains, so recv() succeeds.
+        assert_eq!(Ok(1), receiver.recv());
+    }
+
+    #[test]
+    fn test_recv_no_data_disconnected_updater() {
         let (updater, receiver) = channel::<i32>();
         drop(updater);
+
+        // The updater dropped and no data exists on the buffer.
+        // So recv() fails.
         assert_eq!(Err(RecvError), receiver.recv());
     }
 
     #[test]
     fn test_try_recv() {
         let (updater, receiver) = channel();
+
         // Nothing updated yet
         assert_eq!(Err(TryRecvError::Empty), receiver.try_recv());
-        // Update
+        // Update/receive
         updater.update(1).unwrap();
-        // Receive
         assert_eq!(Ok(1), receiver.try_recv());
+
         // Nothing updated from the last reception
         assert_eq!(Err(TryRecvError::Empty), receiver.try_recv());
     }
@@ -374,7 +422,7 @@ mod tests {
         let (updater, receiver) = channel();
         let updater2 = updater.clone();
 
-        // Receiver should receive only the latest value
+        // Only the latest data will be received
         updater.update(1).unwrap();
         updater2.update(2).unwrap();
         assert_eq!(Ok(2), receiver.try_recv());
@@ -384,54 +432,25 @@ mod tests {
     }
 
     #[test]
-    fn test_try_recv_no_updater() {
-        let (updater, receiver) = channel::<i32>();
+    fn test_try_recv_from_remaining_data_disconnected_updater() {
+        let (updater, receiver) = channel();
+        updater.update(1).unwrap();
         drop(updater);
+
+        // The updater dropped.
+        // but the updated data remains, so try_recv() succeeds.
+        assert_eq!(Ok(1), receiver.try_recv());
+
+        // try_recv fails because nothing updated from the last reception and the updater dropped.
         assert_eq!(Err(TryRecvError::Disconnected), receiver.try_recv());
     }
 
     #[test]
-    fn test_recv_timeout_ok() {
+    fn test_try_recv_no_updater() {
         let (updater, receiver) = channel::<i32>();
-        let join_handle = spawn(move || {
-            sleep(Duration::from_secs(1));
-            updater.update(1).unwrap();
-            sleep(Duration::from_secs(1));
-        });
+        drop(updater);
 
-        assert_eq!(Ok(1), receiver.recv_timeout(Duration::from_secs(2)));
-        join_handle.join().unwrap();
-    }
-
-    #[test]
-    fn test_recv_timeout_no_updater() {
-        let (updater, receiver) = channel::<i32>();
-        let join_handle = spawn(move || {
-            drop(updater);
-        });
-
-        sleep(Duration::from_secs(1));
-
-        assert_eq!(
-            Err(RecvTimeoutError::Disconnected),
-            receiver.recv_timeout(Duration::from_secs(1))
-        );
-        join_handle.join().unwrap();
-    }
-
-    #[test]
-    fn test_recv_timeout_timeout() {
-        let (updater, receiver) = channel::<i32>();
-        let join_handle = spawn(move || {
-            sleep(Duration::from_secs(2));
-            drop(updater);
-        });
-
-        assert_eq!(
-            Err(RecvTimeoutError::Timeout),
-            receiver.recv_timeout(Duration::from_secs(1))
-        );
-        join_handle.join().unwrap();
+        assert_eq!(Err(TryRecvError::Disconnected), receiver.try_recv());
     }
 
     #[test]
