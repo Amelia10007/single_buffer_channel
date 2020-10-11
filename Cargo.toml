@@ -7,3 +7,7 @@ edition = "2018"
 repository = "https://github.com/Amelia10007/single_buffer_channel"
 keywords = ["concurrent", "channel", "std"]
 licence = "Apache-2.0"
+
+[[example]]
+name = "bench_channel"
+path = "examples/bench_channel.rs"
