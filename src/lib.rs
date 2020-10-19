@@ -208,6 +208,53 @@ impl<T> Receiver<T> {
     }
 }
 
+impl<T> IntoIterator for Receiver<T> {
+    type Item = T;
+    type IntoIter = RecvIter<T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        RecvIter { receiver: self }
+    }
+}
+
+/// Represents an iterator that continuously calls [`Receiver::recv`](struct.Receiver.html#method.recv) of a channel.
+/// *See also [`Receiver::into_iter`](struct.Receiver.html#method.into_iter).*
+///
+/// This iterator returns the latest data of the channel as `Some(data)`.
+/// After the sender(s) of the channel has disconnected, this iterator returns `None`.
+/// # Examples
+/// ```
+/// use single_buffer_channel::channel;
+/// use std::thread::{sleep, spawn};
+/// use std::time::Duration;
+///
+/// let (updater, receiver) = channel();
+///
+/// let join_handle = spawn(move || {
+///     for i in 0..10 {
+///         updater.update(i).unwrap();
+///         sleep(Duration::from_millis(10));
+///     }
+/// });
+///
+/// let receptions = receiver.into_iter().collect::<Vec<_>>();
+/// join_handle.join().unwrap();
+///
+/// assert_eq!((0..10).collect::<Vec<_>>(), receptions);
+/// ```
+#[derive(Debug)]
+pub struct RecvIter<T> {
+    receiver: Receiver<T>,
+}
+
+impl<T> Iterator for RecvIter<T> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.receiver.recv().ok()
+    }
+}
+
 /// An error returned from the `recv` function on a `Receiver`.
 ///
 /// This error occurs if `Receiver` has become unable to receive data anymore due to the updater(s)' disconnection.
@@ -495,5 +542,65 @@ mod tests {
         drop(receiver);
 
         assert_eq!(Err(UpdateError(1)), updater.update(1));
+    }
+}
+
+#[cfg(test)]
+mod tests_iter {
+    use super::*;
+
+    #[test]
+    fn test_iter() {
+        let (updater, receiver) = channel();
+
+        let join_handle = std::thread::spawn(move || {
+            for i in 0..10 {
+                updater.update(i).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        });
+
+        let receptions = receiver.into_iter().collect::<Vec<_>>();
+        join_handle.join().unwrap();
+
+        assert_eq!((0..10).collect::<Vec<_>>(), receptions);
+    }
+
+    #[test]
+    fn test_iter_multiple_update() {
+        let (updater, receiver) = channel();
+
+        updater.update(1).unwrap();
+        updater.update(2).unwrap();
+
+        assert_eq!(Some(2), receiver.into_iter().next());
+    }
+
+    #[test]
+    fn test_iter_multiple_updater() {
+        let (updater, receiver) = channel();
+        let updater2 = updater.clone();
+
+        updater.update(1).unwrap();
+        updater2.update(2).unwrap();
+
+        assert_eq!(Some(2), receiver.into_iter().next());
+    }
+
+    #[test]
+    fn test_iter_from_remaining_data_disconnected_updater() {
+        let (updater, receiver) = channel();
+        updater.update(1).unwrap();
+        drop(updater);
+
+        assert_eq!(vec![1], receiver.into_iter().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn test_iter_empty() {
+        let (updater, receiver) = channel::<i32>();
+        drop(updater);
+
+        assert!(receiver.into_iter().next().is_none());
     }
 }
