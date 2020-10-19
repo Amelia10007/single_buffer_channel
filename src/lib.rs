@@ -79,11 +79,13 @@ use std::sync::{Arc, Condvar, Mutex, Weak};
 pub struct Receiver<T> {
     /// Stores the latest data as `Some(data)`, or `None` if updater(s) has not call its `update` yet.
     buffer: Arc<Mutex<Option<T>>>,
+    /// Receives notifications that the data is updated during wait.
     condvar: Arc<Condvar>,
 }
 
 impl<T> Receiver<T> {
     /// Waits the latest data of this channel. This method blocks the current thread.
+    /// Little CPU time is consumed during the block.
     ///
     /// After successful reception, nothing can be retrieved unless the updater(s) updates the data.
     /// # Returns
@@ -126,22 +128,34 @@ impl<T> Receiver<T> {
     /// assert!(receiver.recv().is_err());
     /// ```
     pub fn recv(&self) -> Result<T, RecvError> {
+        use std::time::Duration;
+
         loop {
             match self.try_recv() {
                 Ok(data) => break Ok(data),
                 Err(TryRecvError::Disconnected) => break Err(RecvError),
-                _ => {
-                    let timeout = std::time::Duration::from_millis(1);
-                    let lock = self.buffer.lock().unwrap();
-                    if let Some(data) = self
-                        .condvar
-                        .wait_timeout(lock, timeout)
-                        .unwrap()
-                        .0
-                        .take()
-                    {
+                Err(TryRecvError::Empty) => {
+                    // NOTE: It may be desirable if this timeout duration can be specified by users.
+                    let dur = Duration::from_millis(1);
+                    let guard = self.buffer.lock().unwrap();
+
+                    // Wait a notification from the updater(s) without consuming CPU time.
+                    // Use wait_timeout() instead of wait().
+                    // wait() blocks the current thread forever if the updater(s) dropped after the previous try_recv() is called.
+                    //
+                    // Condvar's wait methods may cause spurious wakeup.
+                    // take() will return None under spurious wakeup because the updater(s) does not update the data yet.
+                    // Thus, spurious wakeup does not corrupt channel's integrity.
+                    if let Some(data) = self.condvar.wait_timeout(guard, dur).unwrap().0.take() {
+                        // The updater(s) sended notification during wait_timeout()
                         break Ok(data);
                     }
+                    // Arrival here means no updater sends notification, the updater(s) dropped or the updater(s) sended it before wait_timeout() is called.
+                    // Under the first case the data may become available later.
+                    // Under the second case, this loop will end in the next loop because try_recv() will return TryRecvError::Disconnected.
+                    // Under the third case the latest data will be captured by try_recv() in the next loop.
+
+                    // In summary, this loop never become infinite loop!
                 }
             }
         }
@@ -239,6 +253,7 @@ impl Error for TryRecvError {}
 pub struct Updater<T> {
     /// Destination to the buffer of the recevier.
     dest: Weak<Mutex<Option<T>>>,
+    /// Sends notifications that the data is updated to the receiver.
     condvar: Weak<Condvar>,
 }
 
@@ -275,6 +290,7 @@ impl<T> Updater<T> {
             // But the owners (receiver and other updaters) never panic at the time.
             // Therefore, this unwrap() always succeeds.
             dest.lock().unwrap().replace(data);
+            // Notify the receiver that a new data is stored.
             condvar.notify_one();
             Ok(())
         } else {
