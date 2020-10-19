@@ -70,7 +70,7 @@
 
 use std::error::Error;
 use std::fmt::{self, Debug, Display, Formatter};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 
 /// The receiving-half of the single data channel.
 ///
@@ -79,6 +79,7 @@ use std::sync::{Arc, Mutex, Weak};
 pub struct Receiver<T> {
     /// Stores the latest data as `Some(data)`, or `None` if updater(s) has not call its `update` yet.
     buffer: Arc<Mutex<Option<T>>>,
+    condvar: Arc<Condvar>,
 }
 
 impl<T> Receiver<T> {
@@ -129,7 +130,19 @@ impl<T> Receiver<T> {
             match self.try_recv() {
                 Ok(data) => break Ok(data),
                 Err(TryRecvError::Disconnected) => break Err(RecvError),
-                _ => {}
+                _ => {
+                    let timeout = std::time::Duration::from_millis(1);
+                    let lock = self.buffer.lock().unwrap();
+                    if let Some(data) = self
+                        .condvar
+                        .wait_timeout(lock, timeout)
+                        .unwrap()
+                        .0
+                        .take()
+                    {
+                        break Ok(data);
+                    }
+                }
             }
         }
     }
@@ -226,6 +239,7 @@ impl Error for TryRecvError {}
 pub struct Updater<T> {
     /// Destination to the buffer of the recevier.
     dest: Weak<Mutex<Option<T>>>,
+    condvar: Weak<Condvar>,
 }
 
 impl<T> Updater<T> {
@@ -256,15 +270,15 @@ impl<T> Updater<T> {
     /// assert!(updater.update(1).is_err());
     /// ```
     pub fn update(&self, data: T) -> Result<(), UpdateError<T>> {
-        match self.dest.upgrade() {
-            Some(dest) => {
-                // lock() fails if another owner of the mutex has panicked during holding it.
-                // But the owners (receiver and other updaters) never panic at the time.
-                // Therefore, this unwrap() always succeeds.
-                dest.lock().unwrap().replace(data);
-                Ok(())
-            }
-            None => Err(UpdateError(data)),
+        if let (Some(dest), Some(condvar)) = (self.dest.upgrade(), self.condvar.upgrade()) {
+            // lock() fails if another owner of the mutex has panicked during holding it.
+            // But the owners (receiver and other updaters) never panic at the time.
+            // Therefore, this unwrap() always succeeds.
+            dest.lock().unwrap().replace(data);
+            condvar.notify_one();
+            Ok(())
+        } else {
+            Err(UpdateError(data))
         }
     }
 }
@@ -273,6 +287,7 @@ impl<T> Clone for Updater<T> {
     fn clone(&self) -> Self {
         Self {
             dest: self.dest.clone(),
+            condvar: self.condvar.clone(),
         }
     }
 }
@@ -310,8 +325,13 @@ impl<T: Debug> Error for UpdateError<T> {}
 pub fn channel<T>() -> (Updater<T>, Receiver<T>) {
     let buffer = Arc::from(Mutex::from(None));
     let dest = Arc::downgrade(&buffer);
-    let receiver = Receiver { buffer };
-    let updater = Updater { dest };
+    let condvar = Arc::from(Condvar::new());
+    let weak_condvar = Arc::downgrade(&condvar);
+    let receiver = Receiver { buffer, condvar };
+    let updater = Updater {
+        dest,
+        condvar: weak_condvar,
+    };
 
     (updater, receiver)
 }
