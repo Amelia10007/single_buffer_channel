@@ -5,8 +5,9 @@ version = "0.1.0"
 authors = ["Amelia10007 <nat.horn.mk0426@gmail.com>"]
 edition = "2018"
 repository = "https://github.com/Amelia10007/single_buffer_channel"
-keywords = ["concurrent", "channel", "std"]
-licence = "Apache-2.0"
+keywords = ["concurrency", "channel", "std"]
+categories = ["concurrency"]
+licence = "MIT"
 
 [[example]]
 name = "bench_channel"
