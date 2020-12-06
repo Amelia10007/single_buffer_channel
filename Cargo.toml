@@ -9,10 +9,10 @@ keywords = ["concurrency", "channel", "std"]
 categories = ["concurrency"]
 licence = "MIT"
 
-[[example]]
+[[bench]]
 name = "bench_channel"
-path = "examples/bench_channel.rs"
+harness = false
 
-[[example]]
-name = "wait_recv"
-path = "examples/wait_recv.rs"
+[[bench]]
+name = "cpu_consumption_during_recv"
+harness = false
