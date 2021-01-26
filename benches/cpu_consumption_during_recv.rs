@@ -9,7 +9,7 @@ fn main() {
         upadter.update(42).unwrap();
     });
 
-    println!("Wait for recieve data. Check CPU consumtion via another terminal (use 'top' or other command)");
+    println!("Wait for recieve data. Check CPU consumption.");
 
     let data = receiver.recv().unwrap();
     assert_eq!(42, data);
